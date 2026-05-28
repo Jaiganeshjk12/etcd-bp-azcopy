@@ -1,5 +1,6 @@
-# UBI image with azcopy + kando + etcdctl for single KubeTask blueprint use.
-# etcdctl is copied from the official etcd image.
+# UBI image with azcopy + kando + etcdctl for the blueprint use.
+# etcdctl & etcdutl is copied from the official etcd image.
+# kando is copied from the kanister-tools image tag 0.119.0, which is the latest as of this commit.
 
 ARG ETCD_SOURCE_IMAGE=quay.io/coreos/etcd:v3.6.11
 

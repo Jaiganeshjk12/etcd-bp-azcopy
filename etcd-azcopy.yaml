@@ -77,7 +77,7 @@ actions:
             BACKUP_LOCATION=${containerprefix}/etcd-blueprint-backups/etcd_backups-{{ toDate "2006-01-02T15:04:05.999999999Z07:00" .Time | date "2006-01-02T15:04:05Z07:00" }}/etcd-backup.tar
 
             # AzCopy uses workload identity token when this is set.
-            #it assumes that the Kasten is configured with a federated identity that has permissions to access the storage account.
+            # The blueprint assumes that the Kasten is configured with a federated identity that has permissions to access the storage account.
             # Federated identity setup details are documented in Kasten docs:
             # https://docs.kasten.io/latest/install/openshift/helm#federated-identity
             export AZCOPY_AUTO_LOGIN_TYPE=workload
