@@ -1,0 +1,181 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: etcd-azcopy
+actions:
+  backup:
+    outputArtifacts:
+      etcdBackup:
+        keyValue:
+          backupLocation: "{{ .Phases.uploadEtcdBackup.Output.backupLocation }}"
+    phases:
+    - func: KubeTask
+      name: checkOperatorProgression
+      args:
+        image: ghcr.io/kanisterio/kanister-kubectl-1.18:0.119.0
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+            backup_resource_list=("kube-apiserver" "kube-controller-manager" "kube-scheduler" "etcd") 
+            for resource in "${backup_resource_list[@]}"; do
+            progressing=$(kubectl get co "${resource}" -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}') || true
+            if [ "$progressing" == "" ]; then
+                echo "Could not find the status of the $resource. Check if the API server is running."
+                exit 1
+            elif [ "$progressing" != "False" ]; then
+                echo "Currently the $resource operator is progressing. A reliable backup requires that a rollout is not in progress.  Aborting!"
+                exit 1
+            else
+                echo "The $resource is not progressing."
+            fi
+            done
+            echo "All required operators are stable; continuing with etcd backup"
+    - func: KubeTask
+      name: uploadEtcdBackup
+      args:
+        podLabels:
+          azure.workload.identity/use: "true"
+        # Placeholder image tag for review.
+        # Replace this with the image you build/push before using this blueprint.
+        image: jaiganeshjk/kanister-etcd-azcopy:3.6.11
+        command:
+          - bash
+          - -o
+          - errexit
+          - -o
+          - pipefail
+          - -c
+          - |
+
+            echo "Starting etcd backup phase"
+
+            # Running the backup script with force flag is safe because operator progression
+            # has already been verified in the previous phase.
+            /etc/kubernetes/static-pod-resources/etcd-certs/configmaps/etcd-scripts/cluster-backup.sh --force /backup/etcd-backup
+            echo "Snapshot and static resources saved under /backup/etcd-backup"
+
+            # Remove dirty-flag marker from file names when present.
+            shopt -s nullglob
+            for f in /backup/etcd-backup/*__POSSIBLY_DIRTY__*; do
+              mv "$f" "${f/__POSSIBLY_DIRTY__/}"
+            done
+            shopt -u nullglob
+            echo "Normalized possibly-dirty snapshot file names"
+
+            tar -C /backup -czf /backup/etcd-backup.tar etcd-backup
+            echo "Created archive: /backup/etcd-backup.tar"
+            ls -lh /backup/etcd-backup.tar
+
+            storageaccount='{{ .Profile.Credential.Secret.Data.azure_storage_account_id | toString }}'
+            storagecontainer='{{ .Profile.Location.Bucket }}'
+            containerprefix='{{ .Profile.Location.Prefix }}'
+            BACKUP_LOCATION=${containerprefix}/etcd-blueprint-backups/etcd_backups-{{ toDate "2006-01-02T15:04:05.999999999Z07:00" .Time | date "2006-01-02T15:04:05Z07:00" }}/etcd-backup.tar
+
+            # AzCopy uses workload identity token when this is set.
+            #it assumes that the Kasten is configured with a federated identity that has permissions to access the storage account.
+            # Federated identity setup details are documented in Kasten docs:
+            # https://docs.kasten.io/latest/install/openshift/helm#federated-identity
+            export AZCOPY_AUTO_LOGIN_TYPE=workload
+            export AZCOPY_JOB_PLAN_LOCATION=/tmp/.azcopy
+            export AZCOPY_LOG_LOCATION=/tmp/.azcopy
+            mkdir -p /tmp/.azcopy
+
+            echo "Uploading archive to blob path: ${storagecontainer}/${BACKUP_LOCATION}"
+            azcopy copy /backup/etcd-backup.tar "https://${storageaccount}.blob.core.windows.net/${storagecontainer}/${BACKUP_LOCATION}"
+            echo "Upload completed"
+
+            # Save artifact path so Kasten can track and use it in delete action.
+            kando output backupLocation $BACKUP_LOCATION
+        podOverride:
+          # Affinity and tolerations ensure this pod runs on control-plane nodes, where static
+          # pod backup scripts and cert artifacts are available under /etc/kubernetes.
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+                  - matchExpressions:
+                    - key: node-role.kubernetes.io/master
+                      operator: Exists
+          tolerations:
+          - key: "node-role.kubernetes.io/master"
+            operator: "Exists"
+            effect: "NoSchedule"
+          - key: "node-role.kubernetes.io/control-plane"
+            operator: "Exists"
+            effect: "NoSchedule"
+          volumes:
+            - name: etc-kubernetes
+              # Read-only hostPath mount required to access static-pod resources and cluster backup scripts.
+              hostPath:
+                path: /etc/kubernetes
+                type: Directory
+            - name: backup-volume
+              ephemeral:
+                volumeClaimTemplate:
+                  metadata:
+                    labels:
+                      kopia: ephemeral-backup-volume
+                  spec:
+                    accessModes: [ "ReadWriteOnce" ]
+                    #storageClassName: "<StorageClassName">
+                    resources:
+                      requests:
+                        storage: 50Gi
+          containers:
+          - name: container
+            # spc_t is required on OpenShift with SELinux enforcing to read hostPath-mounted
+            # static pod resources under /etc/kubernetes.
+            securityContext:
+              seLinuxOptions:
+                type: spc_t
+              runAsUser: 0
+              runAsGroup: 0
+            volumeMounts:
+              - name: etc-kubernetes
+                readOnly: true
+                mountPath: /etc/kubernetes
+              - name: backup-volume
+                mountPath: /backup
+  delete:
+    inputArtifactNames:
+    - etcdBackup
+    phases:
+    - func: KubeTask
+      name: deleteFromObjectStore
+      args:
+        namespace: "{{ .Namespace.Name }}"
+        # Placeholder image tag for review.
+        # Replace this with the image you build/push before using this blueprint.
+        image: jaiganeshjk/kanister-etcd-azcopy:3.6.11
+        command:
+        - bash
+        - -o
+        - errexit
+        - -o
+        - pipefail
+        - -c
+        - |
+           # AzCopy uses workload identity token when this is set.
+           # It assumes that Kasten is configured with a federated identity that has permissions to access the storage account.
+           export AZCOPY_AUTO_LOGIN_TYPE=workload
+           export AZCOPY_JOB_PLAN_LOCATION=/tmp/.azcopy
+           export AZCOPY_LOG_LOCATION=/tmp/.azcopy
+
+           mkdir -p /tmp/.azcopy
+
+           storageaccount='{{ .Profile.Credential.Secret.Data.azure_storage_account_id | toString }}'
+           storagecontainer='{{ .Profile.Location.Bucket }}'
+           BACKUP_LOCATION='{{ .ArtifactsIn.etcdBackup.KeyValue.backupLocation }}'
+
+           azcopy rm https://${storageaccount}.blob.core.windows.net/${storagecontainer}/${BACKUP_LOCATION}
+
+           echo "Backup deleted successfully from object store."
+
