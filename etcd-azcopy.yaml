@@ -38,6 +38,7 @@ actions:
     - func: KubeTask
       name: uploadEtcdBackup
       args:
+        # The label below is needed to inject the Federated credentials to the pod provided the serviceAccount is setup to do so. 
         podLabels:
           azure.workload.identity/use: "true"
         # Placeholder image tag for review.
@@ -152,7 +153,9 @@ actions:
       name: deleteFromObjectStore
       args:
         namespace: "{{ .Namespace.Name }}"
-        # Placeholder image tag for review.
+        # The label below is needed to inject the Federated credentials to the pod provided the serviceAccount is setup to do so. 
+        podLabels:
+          azure.workload.identity/use: "true"
         # Replace this with the image you build/push before using this blueprint.
         image: jaiganeshjk/kanister-etcd-azcopy:3.6.11
         command:
